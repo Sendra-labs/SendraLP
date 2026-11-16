@@ -23,7 +23,8 @@ import {PoolId} from "@uniswap/v4-core/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/types/Currency.sol";
 
 /// @title LiquidityOrchestrator
-/// @notice One entry for Uniswap v3 and v4. Both write Sendra position type 2.
+/// @notice One entry for Uniswap v3 and v4. Spot LP writes Sendra position type 2.
+///         Borrow-to-LP keeps the Aave book as the only Sendra position.
 ///         v3 and v4 differ only in the manager. Partial close removes the LP and
 ///         holds the tokens; the Sendra position stays open until those tokens are sold.
 contract LiquidityOrchestrator is ReentrancyGuard {
@@ -36,6 +37,23 @@ contract LiquidityOrchestrator is ReentrancyGuard {
     ISendraStorage public immutable sendraStorage;
     IPositionInitializer public immutable initializer;
     LpAccounts public immutable lpAccounts;
+
+    /// @dev LP state for a borrow-to-LP. The Aave book is the only Sendra position.
+    mapping(address user => mapping(uint256 positionId => OpenLp)) private borrowedLp;
+    mapping(address user => mapping(uint256 positionId => bool)) private borrowedSet;
+
+    /// @notice Same call the lending cell compiles, with `uniId` as uint128.
+    struct AaveWithdrawInput {
+        uint128 uniId;
+        uint256 positionId;
+        address user;
+    }
+
+    struct AaveExecuteWithdraw {
+        AaveWithdrawInput withdrawInput;
+        UniswapLib.SwapInput swapInput0;
+        UniswapLib.SwapInput swapInput1;
+    }
 
     event LiquidityProvided(address indexed user, uint256 indexed positionId, uint8 protocol, uint256 tokenId);
     event LiquidityUnwound(address indexed user, uint256 indexed positionId, uint256 held0, uint256 held1);
@@ -78,7 +96,7 @@ contract LiquidityOrchestrator is ReentrancyGuard {
     function provideLiquidity(UniswapLib.ExecuteProvideLiquidityInput calldata input)
         external
         nonReentrant
-        returns (uint256 positionId)
+        returns (uint256 positionId, uint256 tokenId)
     {
         UniswapLib.ProvideLiquidityInput memory p = input.provideLiquidityInput;
         _onlyCell(p.user);
@@ -108,8 +126,15 @@ contract LiquidityOrchestrator is ReentrancyGuard {
             IERC20(base).safeTransfer(p.user, refund);
         }
 
-        positionId = _recordOpen(p, minted, base, totalIn - refund);
-        LpPulse.onOpen(sendraStorage, p.user, totalIn - refund);
+        tokenId = minted.tokenId;
+        uint256 aaveId = _leveragedBook(msg.sender);
+        if (aaveId != 0) {
+            _saveBorrowed(p, minted, base, aaveId);
+            positionId = aaveId;
+        } else {
+            positionId = _recordOpen(p, minted, base, totalIn - refund);
+            LpPulse.onOpen(sendraStorage, p.user, totalIn - refund);
+        }
         emit LiquidityProvided(p.user, positionId, uint8(p.protocol), minted.tokenId);
     }
 
@@ -156,21 +181,46 @@ contract LiquidityOrchestrator is ReentrancyGuard {
         nonReentrant
         returns (uint256 baseOut)
     {
-        _onlyCell(input.withdrawInput.user);
-        SendraLib.Position memory position =
-            sendraStorage.getUserPositionById(input.withdrawInput.user, input.withdrawInput.positionId);
-        OpenLp memory s = _loadLive(position, input.withdrawInput.uniId);
-        _sameBase(input.swapInput0, input.swapInput1, s.base);
+        baseOut = _withdraw(input.withdrawInput, input.swapInput0, input.swapInput1);
+    }
+
+    /// @dev Lending cells encode `uniId` as uint128. Spot keeps the uint256 entry above.
+    function withdrawLiquidityAndCollectFees(AaveExecuteWithdraw calldata input)
+        external
+        nonReentrant
+        returns (uint256 baseOut)
+    {
+        baseOut = _withdraw(
+            UniswapLib.WithdrawInput({
+                uniId: input.withdrawInput.uniId,
+                positionId: input.withdrawInput.positionId,
+                user: input.withdrawInput.user
+            }),
+            input.swapInput0,
+            input.swapInput1
+        );
+    }
+
+    function _withdraw(
+        UniswapLib.WithdrawInput memory head,
+        UniswapLib.SwapInput calldata swap0,
+        UniswapLib.SwapInput calldata swap1
+    ) internal returns (uint256 baseOut) {
+        _onlyCell(head.user);
+        if (borrowedSet[head.user][head.positionId]) {
+            return _withdrawBorrowed(head, swap0, swap1);
+        }
+        SendraLib.Position memory position = sendraStorage.getUserPositionById(head.user, head.positionId);
+        OpenLp memory s = _loadLive(position, head.uniId);
+        _sameBase(swap0, swap1, s.base);
 
         UniswapLib.ExitOut memory out = _exit(s, address(this));
-        uint256 feesUsdc = _toBase(s.token0, out.fee0, s.base, input.swapInput0)
-            + _toBase(s.token1, out.fee1, s.base, input.swapInput1);
-        uint256 principalUsdc = _toBase(s.token0, out.principal0, s.base, input.swapInput0)
-            + _toBase(s.token1, out.principal1, s.base, input.swapInput1);
+        uint256 feesUsdc = _toBase(s.token0, out.fee0, s.base, swap0) + _toBase(s.token1, out.fee1, s.base, swap1);
+        uint256 principalUsdc = _toBase(s.token0, out.principal0, s.base, swap0) + _toBase(s.token1, out.principal1, s.base, swap1);
         baseOut = feesUsdc + principalUsdc;
-        _pay(s.base, baseOut, input.withdrawInput.user);
-        int256 pnl = _finalize(position, input.withdrawInput.user, input.withdrawInput.positionId, feesUsdc, baseOut, out.sqrtPrice, s.openDate);
-        emit LiquiditySold(input.withdrawInput.user, input.withdrawInput.positionId, baseOut, pnl);
+        _pay(s.base, baseOut, _proceedsTo(head.user));
+        int256 pnl = _finalize(position, head.user, head.positionId, feesUsdc, baseOut, out.sqrtPrice, s.openDate);
+        emit LiquiditySold(head.user, head.positionId, baseOut, pnl);
     }
 
     function collectFeesOnly(UniswapLib.ExecuteCollectFeesOnly calldata input)
@@ -272,6 +322,8 @@ contract LiquidityOrchestrator is ReentrancyGuard {
     }
 
     function _exit(OpenLp memory s, address recipient) internal returns (UniswapLib.ExitOut memory out) {
+        address manager = s.protocol == uint8(UniswapLib.Protocol.UniswapV3) ? address(managerV3) : address(managerV4);
+        _handNft(UniswapLib.Protocol(s.protocol), s.tokenId, manager);
         if (s.protocol == uint8(UniswapLib.Protocol.UniswapV3)) {
             return managerV3.exit(s.tokenId, s.tickLower, s.tickUpper, s.pool, recipient);
         }
@@ -378,9 +430,167 @@ contract LiquidityOrchestrator is ReentrancyGuard {
         s.sqrtFinal = abi.decode(data[LpData.SQRT_FINAL], (uint160));
     }
 
+    /// @dev USDC from the LP has to land on the lending cell so it can repay the Aave debt.
+    ///      Spot cells have `lpEnabled` and still receive the payout on the owner.
+    function _proceedsTo(address user) internal view returns (address) {
+        if (_protocol(msg.sender) && !_lpEnabled(msg.sender)) return msg.sender;
+        return user;
+    }
+
+    /// @dev A staticcall to a missing `lpEnabled` reverts. Explorers flag that even when the revert is caught.
+    function _lpEnabled(address cell) internal view returns (bool) {
+        if (!_hasSelector(cell, ILpCell.lpEnabled.selector)) return false;
+        (bool ok, bytes memory data) = cell.staticcall(abi.encodeWithSelector(ILpCell.lpEnabled.selector));
+        return ok && data.length == 32 && abi.decode(data, (bool));
+    }
+
+    function _hasSelector(address account, bytes4 selector) internal view returns (bool) {
+        if (_codeHas(account.code, selector)) return true;
+        address impl = _eip1167(account);
+        return impl != address(0) && _codeHas(impl.code, selector);
+    }
+
+    /// @dev EIP-1167 clones keep the function dispatcher on the implementation, not on the proxy.
+    function _eip1167(address account) internal view returns (address impl) {
+        bytes memory code = account.code;
+        if (code.length != 45) return address(0);
+        bytes32 head;
+        bytes32 tail;
+        assembly {
+            head := mload(add(code, 32))
+            tail := mload(add(code, 62))
+        }
+        if (uint256(head) >> 176 != 0x363d3d373d3d3d363d73) return address(0);
+        if (uint256(tail) >> 136 != 0x5af43d82803e903d91602b57fd5bf3) return address(0);
+        impl = address(uint160(uint256(head) >> 16));
+    }
+
+    function _codeHas(bytes memory code, bytes4 selector) internal pure returns (bool found) {
+        uint256 len = code.length;
+        if (len < 4) return false;
+        assembly {
+            let data := add(code, 32)
+            let end := add(data, sub(len, 3))
+            for { let p := data } lt(p, end) { p := add(p, 1) } {
+                if eq(shl(224, shr(224, mload(p))), selector) {
+                    found := 1
+                    p := end
+                }
+            }
+        }
+    }
+
+    /// @dev Active borrow-to-LP book on this cell, or zero when this is a spot LP.
+    function _leveragedBook(address cell) internal view returns (uint256 positionId) {
+        (bool okWho, bytes memory who) = address(addressProvider).staticcall(
+            abi.encodeWithSignature("getAddress(string)", "AaveAccountant")
+        );
+        if (!okWho || who.length != 32) return 0;
+        address accountant = abi.decode(who, (address));
+        if (accountant == address(0)) return 0;
+        (bool ok, bytes memory data) = accountant.staticcall(abi.encodeWithSignature("books(address)", cell));
+        if (!ok || data.length < 64) return 0;
+        uint8 kind;
+        assembly {
+            positionId := mload(add(data, 32))
+            kind := mload(add(data, 64))
+        }
+        if (kind != 8 || positionId == 0) return 0;
+    }
+
+    function _saveBorrowed(
+        UniswapLib.ProvideLiquidityInput memory p,
+        UniswapLib.MintOut memory minted,
+        address base,
+        uint256 aaveId
+    ) internal {
+        OpenLp storage s = borrowedLp[p.user][aaveId];
+        s.token0 = p.token0;
+        s.token1 = p.token1;
+        s.openDate = block.timestamp;
+        s.fee = p.fee;
+        s.tickLower = p.tickLower;
+        s.tickUpper = p.tickUpper;
+        s.recipient = msg.sender;
+        s.tokenId = minted.tokenId;
+        s.protocol = uint8(p.protocol);
+        s.tickSpacing = p.tickSpacing;
+        s.hooks = p.hooks;
+        s.phase = LpData.PHASE_LIVE;
+        s.poolId = minted.poolId;
+        s.pool = minted.pool;
+        s.base = base;
+        borrowedSet[p.user][aaveId] = true;
+    }
+
+    function _withdrawBorrowed(
+        UniswapLib.WithdrawInput memory head,
+        UniswapLib.SwapInput calldata swap0,
+        UniswapLib.SwapInput calldata swap1
+    ) internal returns (uint256 baseOut) {
+        OpenLp storage stored = borrowedLp[head.user][head.positionId];
+        OpenLp memory s = stored;
+        if (s.recipient != msg.sender) revert NotLpCell();
+        if (s.phase != LpData.PHASE_LIVE) revert WrongPhase();
+        if (head.uniId != s.tokenId) revert TokenMismatch();
+        _sameBase(swap0, swap1, s.base);
+        UniswapLib.ExitOut memory out = _exit(s, address(this));
+        uint256 feesUsdc = _toBase(s.token0, out.fee0, s.base, swap0) + _toBase(s.token1, out.fee1, s.base, swap1);
+        uint256 principalUsdc = _toBase(s.token0, out.principal0, s.base, swap0) + _toBase(s.token1, out.principal1, s.base, swap1);
+        baseOut = feesUsdc + principalUsdc;
+        _pay(s.base, baseOut, _proceedsTo(head.user));
+        stored.phase = LpData.PHASE_CLOSED;
+        emit LiquiditySold(head.user, head.positionId, baseOut, int256(baseOut));
+    }
+
+    /// @dev Spot LP uses `LpAccounts.cellFor`. Aave borrows from its own protocol account,
+    ///      which passes either its owner or itself as `user`.
     function _onlyCell(address user) internal view {
-        if (user == address(0) || msg.sender != lpAccounts.cellFor(user)) revert NotLpCell();
-        if (ILpCell(msg.sender).owner() != user) revert NotLpCell();
+        if (user == address(0)) revert NotLpCell();
+        address caller = msg.sender;
+        if (caller == lpAccounts.cellFor(user)) {
+            if (_owner(caller) != user) revert NotLpCell();
+            return;
+        }
+        if (!_protocol(caller)) revert NotLpCell();
+        address owner = _owner(caller);
+        if (owner == address(0) || (user != owner && user != caller)) revert NotLpCell();
+    }
+
+    /// @dev A lending cell approves this orchestrator for the NFT. The manager is who
+    ///      Uniswap checks, so move the token when the manager is not already allowed.
+    function _handNft(UniswapLib.Protocol protocol, uint256 tokenId, address manager) internal {
+        if (tokenId == 0 || protocol == UniswapLib.Protocol.UniswapV2) return;
+        address npm = protocol == UniswapLib.Protocol.UniswapV3
+            ? address(managerV3.positionManager())
+            : address(managerV4.positionManager());
+        (bool okOwner, bytes memory ownerData) = npm.staticcall(abi.encodeWithSignature("ownerOf(uint256)", tokenId));
+        if (!okOwner || ownerData.length != 32) return;
+        address holder = abi.decode(ownerData, (address));
+        if (holder == manager || holder == address(0)) return;
+        (bool okAll, bytes memory allData) = npm.staticcall(
+            abi.encodeWithSignature("isApprovedForAll(address,address)", holder, manager)
+        );
+        if (okAll && allData.length == 32 && abi.decode(allData, (bool))) return;
+        (bool okOne, bytes memory oneData) = npm.staticcall(abi.encodeWithSignature("getApproved(uint256)", tokenId));
+        if (okOne && oneData.length == 32 && abi.decode(oneData, (address)) == manager) return;
+        (bool moved,) = npm.call(
+            abi.encodeWithSignature("transferFrom(address,address,uint256)", holder, manager, tokenId)
+        );
+        if (!moved) revert NotLpCell();
+    }
+
+    function _owner(address cell) internal view returns (address owner) {
+        (bool ok, bytes memory data) = cell.staticcall(abi.encodeWithSignature("owner()"));
+        if (!ok || data.length != 32) return address(0);
+        owner = abi.decode(data, (address));
+    }
+
+    function _protocol(address account) internal view returns (bool) {
+        (bool ok, bytes memory data) = addressProvider.getAddress("AccountAccessControl").staticcall(
+            abi.encodeWithSignature("isProtocolAccount(address)", account)
+        );
+        return ok && data.length == 32 && abi.decode(data, (bool));
     }
 
     function _sameBase(UniswapLib.SwapInput calldata a, UniswapLib.SwapInput calldata b, address expected) internal pure {

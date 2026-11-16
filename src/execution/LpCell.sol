@@ -8,7 +8,9 @@ import {ISendraAddressProvider} from "../interfaces/iSendraCore/ISendraAddressPr
 import {UniswapLib} from "../lib/uniswap/Uniswap.lib.sol";
 
 interface ILiquidityOrchestrator {
-    function provideLiquidity(UniswapLib.ExecuteProvideLiquidityInput calldata input) external returns (uint256 positionId);
+    function provideLiquidity(UniswapLib.ExecuteProvideLiquidityInput calldata input)
+        external
+        returns (uint256 positionId, uint256 tokenId);
 
     function partialClose(UniswapLib.PartialCloseInput calldata input) external;
 
@@ -78,7 +80,7 @@ contract LpCell {
             IERC20(base).forceApprove(orch, total);
         }
         _approvePositions();
-        positionId = ILiquidityOrchestrator(orch).provideLiquidity(input);
+        (positionId,) = ILiquidityOrchestrator(orch).provideLiquidity(input);
     }
 
     function partialClose(UniswapLib.PartialCloseInput calldata input) external onlyOwner nonReentrant {
