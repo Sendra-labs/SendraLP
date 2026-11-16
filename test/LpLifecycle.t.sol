@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IHooks} from "@uniswap/v4-core/interfaces/IHooks.sol";
 import {PoolKey} from "@uniswap/v4-core/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/types/PoolId.sol";
@@ -274,6 +275,47 @@ contract LpLifecycleTest is Test {
         assertEq(store.activeOf(user), 1);
     }
 
+    function test_lendingCloneCloseSkipsMissingLp() public {
+        _cell(user);
+        address cell = Clones.clone(address(new BareCell()));
+        BareCell(cell).initialize(user);
+        MockAccountAccess(provider.getAddress("AccountAccessControl")).setIsProtocolAccount(cell);
+        usdc.mint(cell, 2 * A);
+        vm.prank(cell);
+        usdc.approve(address(orch), type(uint256).max);
+
+        vm.prank(cell);
+        (uint256 id, uint256 tokenId) = orch.provideLiquidity(_order(user, UniswapLib.Protocol.UniswapV3));
+        uint256 userBefore = usdc.balanceOf(user);
+
+        vm.expectCall(cell, abi.encodeWithSignature("lpEnabled()"), 0);
+        vm.prank(cell);
+        uint256 got = orch.withdrawLiquidityAndCollectFees(_withdraw(user, id, tokenId));
+
+        assertEq(got, 2 * A);
+        assertEq(usdc.balanceOf(cell), 2 * A);
+        assertEq(usdc.balanceOf(user), userBefore);
+    }
+
+    function test_protocolAaveCellCanProvide() public {
+        _cell(user);
+        AaveCell aave = new AaveCell(user);
+        MockAccountAccess(provider.getAddress("AccountAccessControl")).setIsProtocolAccount(address(aave));
+        usdc.mint(address(aave), 2 * A);
+        vm.prank(address(aave));
+        usdc.approve(address(orch), type(uint256).max);
+
+        UniswapLib.ExecuteProvideLiquidityInput memory input = _order(user, UniswapLib.Protocol.UniswapV3);
+        vm.prank(address(aave));
+        (uint256 id,) = orch.provideLiquidity(input);
+        assertEq(abi.decode(store.getUserPositionById(user, id).positionData[LpData.RECIPIENT], (address)), address(aave));
+
+        AaveCell stranger = new AaveCell(user);
+        vm.prank(address(stranger));
+        vm.expectRevert(LiquidityOrchestrator.NotLpCell.selector);
+        orch.provideLiquidity(input);
+    }
+
     function test_rejectsDirectCallAndEarlySell() public {
         address cell = _cell(user);
         vm.expectRevert(LiquidityOrchestrator.NotLpCell.selector);
@@ -407,5 +449,21 @@ contract LpLifecycleTest is Test {
 
     function _tokenBalance(address holder, address token) internal view returns (uint256) {
         return MockERC20(token).balanceOf(holder);
+    }
+}
+
+contract AaveCell {
+    address public owner;
+
+    constructor(address _owner) {
+        owner = _owner;
+    }
+}
+
+contract BareCell {
+    address public owner;
+
+    function initialize(address who) external {
+        owner = who;
     }
 }

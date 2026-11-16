@@ -41,7 +41,11 @@ contract MockAccountsManager {
 }
 
 contract MockAccountAccess {
-    function setIsProtocolAccount(address) external {}
+    mapping(address => bool) public isProtocolAccount;
+
+    function setIsProtocolAccount(address account) external {
+        isProtocolAccount[account] = true;
+    }
 }
 
 contract MockStorage is ISendraStorage {

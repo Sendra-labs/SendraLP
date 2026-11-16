@@ -24,6 +24,9 @@ library UniswapParamsEncoderLib {
         bytes memory commandsBuf = new bytes(params.swapInstructions.length);
         bytes[] memory inputsBuf = new bytes[](params.swapInstructions.length);
         uint256 outCount = 0;
+        // Universal Router decodes a sixth word, minHopPriceX36. Empty disables the check.
+        // Omitting it makes toUint256Array read the path length as an offset and revert SliceOutOfBounds.
+        uint256[] memory noHopFloor = new uint256[](0);
 
         uint256 i = 0;
         while (i < params.swapInstructions.length) {
@@ -60,7 +63,8 @@ library UniswapParamsEncoderLib {
                     firstHop.amountIn,
                     lastHop.amountOut,
                     path,
-                    payerIsUser
+                    payerIsUser,
+                    noHopFloor
                 );
                 outCount++;
                 i = j + 1;
@@ -74,12 +78,16 @@ library UniswapParamsEncoderLib {
 
             if (hop.protocol == UniswapLib.Protocol.UniswapV2) {
                 commandsBuf[outCount] = bytes1(0x08);
+                address[] memory v2Path = new address[](2);
+                v2Path[0] = hop.tokenIn;
+                v2Path[1] = hop.tokenOut;
                 inputsBuf[outCount] = abi.encode(
                     hopRecipient,
                     hop.amountIn,
                     hop.amountOut,
-                    [hop.tokenIn, hop.tokenOut],
-                    hopPayerIsUser
+                    v2Path,
+                    hopPayerIsUser,
+                    noHopFloor
                 );
             } else if (hop.protocol == UniswapLib.Protocol.UniswapV4) {
                 commandsBuf[outCount] = bytes1(0x10);
